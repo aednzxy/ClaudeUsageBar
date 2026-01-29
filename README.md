@@ -9,17 +9,17 @@ A macOS menu bar app that displays your Claude subscription usage (session & wee
 
 ## Screenshots
 
-<!-- Add your screenshots here -->
-![Menu Bar](screenshots/menubar.png)
-![Detail Popover](screenshots/popover.png)
+<img src="screenshots/menubar.png" alt="Menu Bar" height="39">
+
+<img src="screenshots/popover.png" alt="Detail Popover" width="346">
 
 ## Features
 
 - **Real-time usage display** - Shows 5-hour session and 7-day weekly usage percentages
 - **Color-coded status**:
+  - Red - Nearly exhausted (>90% used)
+  - Orange - Burning too fast (usage % > time elapsed %)
   - Green - On track (usage % <= time elapsed %)
-  - Orange - Burning too fast (will run out before reset)
-  - Red - Critical (>90% used)
 - **Click to expand** - Shows detailed breakdown and time until reset
 - **Auto-refresh** - Updates every 60 seconds
 
