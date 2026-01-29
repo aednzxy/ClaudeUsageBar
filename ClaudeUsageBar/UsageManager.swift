@@ -49,7 +49,7 @@ class UsageManager: ObservableObject {
     // Calculate status based on utilization directly (API returns percentage)
     var sessionStatus: UsageStatus {
         guard let usage = sessionUsage else { return .unknown }
-        if usage > 90 { return .red }
+        if usage >= 100 { return .red }
 
         // For 5-hour window: calculate time elapsed
         if let reset = sessionResetAt {
@@ -67,7 +67,7 @@ class UsageManager: ObservableObject {
 
     var weeklyStatus: UsageStatus {
         guard let usage = weeklyUsage else { return .unknown }
-        if usage > 90 { return .red }
+        if usage >= 100 { return .red }
 
         // For 7-day window: calculate time elapsed
         if let reset = weeklyResetAt {
