@@ -17,7 +17,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var popover: NSPopover!
     var rightClickMenu: NSMenu!
 
-    static let appVersion = "1.0.0"
+    static let appVersion = "1.0.1"
 
     var showValues: Bool {
         UserDefaults.standard.bool(forKey: "showValues")
