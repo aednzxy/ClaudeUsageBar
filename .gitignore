@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+DerivedData/
+*.dmg
+
+# Xcode
+*.xcuserdata
+*.xcworkspace
+xcuserdata/
+*.xcscmblueprint
+
+# macOS
+.DS_Store
+*.swp
+
+# Module caches
+ModuleCache.noindex/
+CompilationCache.noindex/
