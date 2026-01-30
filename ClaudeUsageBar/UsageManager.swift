@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 enum UsageStatus {
     case unknown
@@ -31,6 +32,14 @@ struct UsageResponse: Codable {
     }
 }
 
+struct KeychainCredentials: Codable {
+    let claudeAiOauth: OAuthToken?
+
+    struct OAuthToken: Codable {
+        let accessToken: String
+    }
+}
+
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Double?
     @Published var weeklyUsage: Double?
@@ -42,9 +51,11 @@ class UsageManager: ObservableObject {
     var onUpdate: (() -> Void)?
     private var timer: Timer?
 
-    private let cacheFile = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude")
-        .appendingPathComponent("usage-cache.json")
+    // Keychain service names to try
+    private let keychainServices = [
+        "Claude Code-credentials",
+        "Claude Safe Storage"
+    ]
 
     // Calculate status based on utilization directly (API returns percentage)
     var sessionStatus: UsageStatus {
@@ -127,109 +138,95 @@ class UsageManager: ObservableObject {
         isLoading = true
         error = nil
 
-        // Run the fetch script in background
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            self?.runFetchScript()
-
-            // Then read the cache file
+        // Get token from keychain (this will trigger prompt if needed)
+        guard let token = getTokenFromKeychain() else {
             DispatchQueue.main.async {
-                self?.readCacheFile()
+                self.isLoading = false
+                self.error = "No credentials found. Please log in to Claude Code or Claude Desktop."
+                self.onUpdate?()
             }
+            return
         }
+
+        // Fetch usage from API
+        fetchUsageFromAPI(token: token)
     }
 
-    private func runFetchScript() {
-        // Try running the bundled script first, fall back to installed location
-        let scriptLocations = [
-            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/fetch-usage.sh"),
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".claude")
-                .appendingPathComponent("fetch-usage.sh"),
-            URL(fileURLWithPath: "/Applications/ClaudeUsageBar.app/Contents/Resources/fetch-usage.sh")
+    private func getTokenFromKeychain() -> String? {
+        for service in keychainServices {
+            if let token = readKeychainItem(service: service) {
+                return token
+            }
+        }
+        return nil
+    }
+
+    private func readKeychainItem(service: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
-        var scriptPath: String?
-        for location in scriptLocations {
-            if FileManager.default.fileExists(atPath: location.path) {
-                scriptPath = location.path
-                break
-            }
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return nil
         }
 
-        // If not found, create it in ~/.claude/
-        if scriptPath == nil {
-            print("fetch-usage.sh not found in any expected location, creating...")
-            let destPath = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".claude")
-                .appendingPathComponent("fetch-usage.sh")
-
-            // Script content inline as fallback
-            let scriptContent = """
-            #!/bin/bash
-            CACHE_FILE="$HOME/.claude/usage-cache.json"
-            get_token() {
-                local creds token
-                # Try Claude Code CLI credentials first
-                creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-                if [ -n "$creds" ]; then
-                    token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
-                    if [ -n "$token" ]; then echo "$token"; return 0; fi
-                fi
-                # Fall back to Claude Desktop app credentials
-                creds=$(security find-generic-password -s "Claude Safe Storage" -w 2>/dev/null)
-                if [ -n "$creds" ]; then
-                    token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
-                    if [ -n "$token" ]; then echo "$token"; return 0; fi
-                fi
-                return 1
-            }
-            TOKEN=$(get_token)
-            if [ -z "$TOKEN" ]; then
-                echo '{"error": "Could not get token"}' > "$CACHE_FILE"
-                exit 1
-            fi
-            USAGE=$(curl -s -H "Authorization: Bearer $TOKEN" -H "anthropic-beta: oauth-2025-04-20" -H "User-Agent: claude-code/2.0.31" "https://api.anthropic.com/api/oauth/usage")
-            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            echo "$USAGE" | python3 -c "import sys,json; d=json.load(sys.stdin); d['fetched_at']='$TIMESTAMP'; print(json.dumps(d))" > "$CACHE_FILE"
-            """
-
-            try? scriptContent.write(to: destPath, atomically: true, encoding: .utf8)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destPath.path)
-            scriptPath = destPath.path
+        // Parse the JSON to extract the OAuth token
+        guard let jsonData = jsonString.data(using: .utf8),
+              let credentials = try? JSONDecoder().decode(KeychainCredentials.self, from: jsonData),
+              let token = credentials.claudeAiOauth?.accessToken else {
+            return nil
         }
 
-        guard let finalPath = scriptPath else {
-            print("Could not create or find fetch script")
-            return
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [finalPath]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            print("Failed to run fetch script: \(error)")
-        }
+        return token
     }
 
-    private func readCacheFile() {
-        isLoading = false
-
-        guard FileManager.default.fileExists(atPath: cacheFile.path) else {
-            error = "No cache file. Run fetch-usage.sh first."
-            onUpdate?()
+    private func fetchUsageFromAPI(token: String) {
+        guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
+            DispatchQueue.main.async {
+                self.isLoading = false
+                self.error = "Invalid API URL"
+                self.onUpdate?()
+            }
             return
         }
 
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("claude-code/2.0.31", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                self?.isLoading = false
+
+                if let error = error {
+                    self?.error = "Network error: \(error.localizedDescription)"
+                    self?.onUpdate?()
+                    return
+                }
+
+                guard let data = data else {
+                    self?.error = "No data received"
+                    self?.onUpdate?()
+                    return
+                }
+
+                self?.parseUsageResponse(data: data)
+            }
+        }.resume()
+    }
+
+    private func parseUsageResponse(data: Data) {
         do {
-            let data = try Data(contentsOf: cacheFile)
-            let decoder = JSONDecoder()
-            let response = try decoder.decode(UsageResponse.self, from: data)
+            let response = try JSONDecoder().decode(UsageResponse.self, from: data)
 
             if let err = response.error {
                 self.error = err
@@ -255,7 +252,7 @@ class UsageManager: ObservableObject {
             self.error = nil
 
         } catch {
-            self.error = "Failed to parse cache: \(error.localizedDescription)"
+            self.error = "Failed to parse response: \(error.localizedDescription)"
         }
 
         onUpdate?()
