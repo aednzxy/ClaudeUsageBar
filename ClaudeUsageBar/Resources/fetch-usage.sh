@@ -8,12 +8,30 @@ CREDS_FILE="$HOME/.claude/.oauth-token"
 # Get token from keychain (will prompt once, then remember)
 get_token() {
     local creds
+    local token
+
+    # Try Claude Code CLI credentials first
     creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-    if [ -z "$creds" ]; then
-        echo "Error: Could not read credentials from keychain" >&2
-        return 1
+    if [ -n "$creds" ]; then
+        token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+        if [ -n "$token" ]; then
+            echo "$token"
+            return 0
+        fi
     fi
-    echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null
+
+    # Fall back to Claude Desktop app credentials
+    creds=$(security find-generic-password -s "Claude Safe Storage" -w 2>/dev/null)
+    if [ -n "$creds" ]; then
+        token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+        if [ -n "$token" ]; then
+            echo "$token"
+            return 0
+        fi
+    fi
+
+    echo "Error: Could not read credentials from keychain" >&2
+    return 1
 }
 
 # Fetch usage from API
