@@ -46,10 +46,12 @@ class UsageManager: ObservableObject {
     @Published var sessionResetAt: Date?
     @Published var weeklyResetAt: Date?
     @Published var isLoading = false
+    @Published var isRefreshingToken = false
     @Published var error: String?
 
     var onUpdate: (() -> Void)?
     private var timer: Timer?
+    private var hasAttemptedRefresh = false  // Prevent infinite refresh loops
 
     // Keychain service names to try
     private let keychainServices = [
@@ -204,24 +206,190 @@ class UsageManager: ObservableObject {
         request.setValue("claude-code/2.0.31", forHTTPHeaderField: "User-Agent")
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+
+            // Check for 401 Unauthorized - token may have expired
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 401 {
+                self.handleTokenExpired()
+                return
+            }
+
             DispatchQueue.main.async {
-                self?.isLoading = false
+                self.isLoading = false
+                // Reset refresh flag on successful connection (even if data parsing fails)
+                self.hasAttemptedRefresh = false
 
                 if let error = error {
-                    self?.error = "Network error: \(error.localizedDescription)"
-                    self?.onUpdate?()
+                    self.error = "Network error: \(error.localizedDescription)"
+                    self.onUpdate?()
                     return
                 }
 
                 guard let data = data else {
-                    self?.error = "No data received"
-                    self?.onUpdate?()
+                    self.error = "No data received"
+                    self.onUpdate?()
                     return
                 }
 
-                self?.parseUsageResponse(data: data)
+                self.parseUsageResponse(data: data)
             }
         }.resume()
+    }
+
+    private func handleTokenExpired() {
+        // Only attempt refresh once per fetch cycle to prevent infinite loops
+        if hasAttemptedRefresh {
+            DispatchQueue.main.async {
+                self.isLoading = false
+                self.error = "Token expired. Please run 'claude' in terminal to re-authenticate."
+                self.onUpdate?()
+            }
+            return
+        }
+
+        hasAttemptedRefresh = true
+
+        Task {
+            let success = await refreshToken()
+            await MainActor.run {
+                if success {
+                    // Token refreshed, retry the fetch
+                    self.fetchUsage()
+                } else {
+                    self.isLoading = false
+                    self.error = "Token expired. Please run 'claude' in terminal to re-authenticate."
+                    self.onUpdate?()
+                }
+            }
+        }
+    }
+
+    // MARK: - Token Refresh
+
+    /// Refresh OAuth token by running the Claude CLI
+    /// Returns true if refresh was successful, false otherwise
+    func refreshToken() async -> Bool {
+        await MainActor.run {
+            isRefreshingToken = true
+            onUpdate?()
+        }
+
+        defer {
+            Task { @MainActor in
+                isRefreshingToken = false
+                onUpdate?()
+            }
+        }
+
+        guard let cliPath = findClaudeCLI() else {
+            print("Claude CLI not found")
+            return false
+        }
+
+        return await runClaudeCLI(at: cliPath)
+    }
+
+    /// Called on app startup to ensure tokens are fresh
+    func refreshTokenOnStartup() async -> Bool {
+        return await refreshToken()
+    }
+
+    private func findClaudeCLI() -> String? {
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
+
+        // Common installation paths
+        let paths = [
+            "\(homeDir)/.local/bin/claude",
+            "/usr/local/bin/claude",
+            "/opt/homebrew/bin/claude",
+            "\(homeDir)/.claude/local/claude"
+        ]
+
+        // Check each path
+        for path in paths {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+
+        // Fallback: try to find via which command
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = ["claude"]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !output.isEmpty,
+               FileManager.default.isExecutableFile(atPath: output) {
+                return output
+            }
+        } catch {
+            print("Failed to run which: \(error)")
+        }
+
+        return nil
+    }
+
+    private func runClaudeCLI(at path: String) async -> Bool {
+        return await withCheckedContinuation { continuation in
+            let process = Process()
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: path)
+            // Use --version as it's quick and non-interactive, but should still trigger auth refresh
+            process.arguments = ["--version"]
+            process.standardOutput = outputPipe
+            process.standardError = errorPipe
+            // Close stdin to prevent any interactive prompts
+            process.standardInput = FileHandle.nullDevice
+
+            // Set up timeout
+            let timeoutSeconds: Double = 30
+            var didTimeout = false
+            let timeoutWorkItem = DispatchWorkItem {
+                didTimeout = true
+                if process.isRunning {
+                    process.terminate()
+                }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                timeoutWorkItem.cancel()
+
+                if didTimeout {
+                    print("Claude CLI timed out")
+                    continuation.resume(returning: false)
+                    return
+                }
+
+                let exitCode = process.terminationStatus
+                if exitCode == 0 {
+                    print("Claude CLI executed successfully")
+                    continuation.resume(returning: true)
+                } else {
+                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
+                    print("Claude CLI exited with code \(exitCode): \(errorOutput)")
+                    continuation.resume(returning: false)
+                }
+            } catch {
+                timeoutWorkItem.cancel()
+                print("Failed to run Claude CLI: \(error)")
+                continuation.resume(returning: false)
+            }
+        }
     }
 
     private func parseUsageResponse(data: Data) {

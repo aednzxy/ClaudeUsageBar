@@ -31,7 +31,17 @@ struct UsageDetailView: View {
 
             Divider()
 
-            if let error = usageManager.error {
+            if usageManager.isRefreshingToken {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                    Text("Refreshing authentication...")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 8)
+            } else if let error = usageManager.error {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Image(systemName: "exclamationmark.triangle")

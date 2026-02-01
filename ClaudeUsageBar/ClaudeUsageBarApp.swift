@@ -17,7 +17,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var popover: NSPopover!
     var rightClickMenu: NSMenu!
 
-    static let appVersion = "1.0.3"
+    static let appVersion = "1.1.0"
 
     var showValues: Bool {
         UserDefaults.standard.bool(forKey: "showValues")
@@ -59,13 +59,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         popover.contentViewController = NSHostingController(rootView: detailView)
 
-        // Start fetching usage
+        // Set up update callback
         usageManager.onUpdate = { [weak self] in
             DispatchQueue.main.async {
                 self?.updateStatusButton()
             }
         }
-        usageManager.startPolling()
+
+        // Refresh token on startup, then start polling
+        Task {
+            _ = await usageManager.refreshTokenOnStartup()
+            await MainActor.run {
+                usageManager.startPolling()
+            }
+        }
     }
 
     func updateStatusButton() {
